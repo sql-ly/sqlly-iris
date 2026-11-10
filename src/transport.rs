@@ -27,7 +27,7 @@ pub(crate) async fn establish(config: &Config, tcp: tokio::net::TcpStream) -> Re
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
     if let Some(path) = &config.ca_certificate {
-        let pem = std::fs::read(path).map_err(|error| {
+        let pem = tokio::fs::read(path).await.map_err(|error| {
             Error::Tls(format!(
                 "failed to read CA certificate {}: {error}",
                 path.display()
