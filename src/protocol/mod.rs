@@ -7,4 +7,4 @@ pub(crate) use list::{
     ListItem, MAX_LIST_DATA_LEN, encode_item, encode_raw_string, encode_string, encoded_text_len,
     validate_parameter,
 };
-pub(crate) use sql::rewrite_placeholders;
+pub(crate) use sql::{placeholder_count, rewrite_placeholders};

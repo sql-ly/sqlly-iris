@@ -13,14 +13,37 @@ categories = ["database"]
 name = "sqlly_iris"
 
 [dependencies]
+async-stream = "0.3"
+futures-core = "0.3"
+bigdecimal = { version = "0.4", optional = true }
+chrono = { version = "0.4", optional = true }
 percent-encoding = "2"
+rust_decimal = { version = "1", optional = true }
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
+serde = { version = "1", optional = true, features = ["derive"] }
 thiserror = "2"
+time = { version = "0.3", optional = true, features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
 tracing = "0.1"
 url = "2"
+uuid = { version = "1", optional = true, features = ["v4"] }
+webpki-roots = "1"
 zeroize = "1"
 
+[features]
+default = []
+bigdecimal = ["dep:bigdecimal"]
+chrono = ["dep:chrono"]
+rust_decimal = ["dep:rust_decimal"]
+serde = ["dep:serde"]
+time = ["dep:time"]
+uuid = ["dep:uuid"]
+
 [dev-dependencies]
+futures-util = "0.3"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 

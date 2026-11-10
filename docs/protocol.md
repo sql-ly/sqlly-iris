@@ -49,19 +49,19 @@ This transformation is reversible obfuscation, not encryption. Tap files, driver
 
 ## Connection session options
 
-The working native login requests fast select, durable transactions, and output redirection, combined feature mask 37 (`1 | 4 | 32`). The captured ODBC driver requested mask 11 (`1 | 2 | 8`), which the independent implementation labels fast select, fast insert, and not-nullable. Feature masks must be decoded bit by bit rather than inferred from a total, and each payload change needs its own capture.
+The default native login requests fast select, durable transactions, and output redirection, combined feature mask 37 (`1 | 4 | 32`). Setting `fast_insert` adds bit 2, producing mask 39. The captured ODBC driver requested mask 11 (`1 | 2 | 8`), which the independent implementation labels fast select, fast insert, and not-nullable. Feature masks must be decoded bit by bit, and each payload change needs its own capture.
 
-A successful connection response contains product text, delimited-identifier behavior, an unknown integer, isolation state, server job number, empty-string behavior, and server feature options. SQLCODE 417 during connection carries its error text directly in the response payload.
+A successful connection response contains product text, delimited-identifier behavior, an unknown integer, isolation state, server job number, empty-string behavior, and server feature options. SQLCODE 417 during connection carries its error text directly in the response payload. TLS uses an asynchronous rustls handshake with native trust roots and optional additional CA files before protocol negotiation; plaintext fallback is not attempted.
 
 ## Query flow
 
-The native client currently uses `DQ` for direct queries. Its payload contains chunked SQL text, parameter descriptors, one parameter set, query timeout, and maximum result rows. SQL text is split into 31,904-byte chunks, matching the independent implementation; Unicode-safe chunking and larger parameter streams need more coverage.
+The native client uses `DQ` for direct queries and `PQ` for prepared queries. Its payload contains chunked SQL text, parameter descriptors, one parameter set, query timeout, and maximum result rows. SQL text is split into 31,904-byte chunks, matching the independent implementation; Unicode-safe chunking and larger parameter streams need more coverage.
 
 Placeholders become `:%qpar(n)` before transmission. The rewriter tracks single quotes, double quotes, backticks, line comments, and block comments, so literal and commented question marks are untouched. ODBC captures show the vendor driver using the same host-variable naming scheme when it rewrites literals.
 
-A successful query returns a metadata frame followed by a data frame. Metadata contains statement features, column count, and per-column name, SQL type, precision, scale, nullability, label, table, schema, catalog, flags, and optionally a fast-select slot. Parameter count and flags follow the columns. Column flags observed include auto-increment, case sensitivity, currency, read-only, and row id.
+A successful direct query returns a metadata frame followed by a data frame. A prepared query reuses the `PP` metadata and returns data through `PQ`. Metadata contains statement features, column count, and per-column name, SQL type, precision, scale, nullability, label, table, schema, catalog, flags, and optionally a fast-select slot. Parameter count and flags follow the columns. Column flags observed include auto-increment, case sensitivity, currency, read-only, and row id.
 
-Fast-select data packs each row inside another list item and uses one-based slot positions in metadata. The implementation validates every slot and every nested item boundary.
+Fast-select data packs each row inside another list item and uses one-based slot positions in metadata. The implementation validates every slot and nested item boundary. A procedure statement marker of -1 is not treated as fast-select, even though its low bit is set.
 
 When the current buffer is exhausted and status is not 100, the client sends `FD` with the active statement id. ODBC captures confirm this statement id is required; sending zero caused SQLCODE -400 with an undefined statement-cache reference. `max_rows` limits total returned rows and does not control the continuation buffer size.
 
@@ -71,13 +71,23 @@ ODBC prepares with `PP` and executes with `PU`, using the same nonzero statement
 
 An early attempt to treat the prepare response as if it also contained the affected-row count failed on the three zero-valued items returned for DDL. Sending `PU` after an inappropriate direct-update preparation produced SQLCODE 404, `Reprepare statement - INTERNAL ONLY, DO NOT DOCUMENT`. The final client follows the observed `PP`/`PU` sequence and passes DDL and parameterized inserts.
 
-ODBC sends `CU` to close prepared statements. Native statement lifetime, explicit close, cached reuse, and reprepare behavior remain to be implemented.
+ODBC sends `CU` to close prepared statements, and there is no completion frame. Explicit statement close writes `CU` immediately; dropping a statement queues `CU` for the next operation. Delayed responses are correlated by message count rather than discarded.
+
+Fast parameter arrays are opt-in. The execution starts with a raw little-endian 32-bit batch count, followed by key-request text, zero, key count, and per-row empty delimiters and packed list-item strings. The metadata provides identity/default values and target table information. Single-row statements use the standard update path.
+
+## Procedure and session flow
+
+Direct procedure calls use `DS` with a procedure name and arguments. A response with result kind -1 enters `MS` for the first result and `MR` for subsequent results. Scalar procedures return `_isc_sp_ret_val` directly during `DS` and do not enter `MS`. Result frames may contain a return value, metadata, and rows; `MD` drains continuation frames until status 100. The end-of-results marker is -2.
+
+Autocommit and isolation setters use ordered writes without reads for `AF`/`AN` and `RC`/`RU`. `TC`/`TR` complete transactions, and `TS` returns a real success or error response. Delayed stream-write acknowledgments are tracked by message count and checked rather than treated as a later query response.
 
 ## Stream references and time
 
-`LONGVARCHAR` cells can contain a composite list-encoded stream reference rather than inline text. `JS` with that reference and requested length -1 returns the stream contents as raw frame payload. The current client supports whole-value character reads and binary reads through the same path; chunked reads, writes, truncation, and positions need their own state machine.
+`LONGVARCHAR` cells can contain a composite list-encoded stream reference rather than inline text. `JS` with that reference and a positive requested length returns a prefix, while -1 returns the entire stream again; it is stateless rather than a cursor. `SS` returns byte length. `SZ` sends handle, zero-based position, byte count, then raw bytes. `SX` sends handle and truncation length, and `CS` closes the handle. Their delayed acknowledgments are correlated and checked, while failures make the session unusable.
 
 IRIS metadata can report type 1093 for timestamp data. For a positive encoded integer, XOR with `0x1000000000000000` yields signed Unix microseconds. For a nonpositive encoded integer, OR with `0x6000000000000000` performs the corresponding legacy-range decode. Seconds use Euclidean division by one million and the remaining microseconds are nonnegative. The live value decoded to `2026-11-09T13:14:15.123456Z` and round-tripped as a parameter.
+
+Native operations also use success/result markers rather than ordinary SQL statuses: `0xCA00` is native success, `0xCDF1` represents an undefined global, and `0xCE7B` is a method-status result. These are handled only in the native operation path, not by weakening ordinary SQL error handling.
 
 ## Operation catalog
 
@@ -90,7 +100,7 @@ Observed means seen in this repository's live captures. Listed means present in 
 | `DC` | Disconnect | Observed ODBC and native |
 | `PP` | Prepare | Observed ODBC and native |
 | `PU` | Prepared update execute | Observed ODBC and native |
-| `PQ` | Prepared query execute | Observed ODBC |
+| `PQ` | Prepared query execute | Observed ODBC and native |
 | `DQ` | Direct query | Observed native |
 | `DU` | Direct update | Observed native experiment; final updates use `PP`/`PU` |
 | `FD` | Fetch data | Observed ODBC and native |
@@ -98,46 +108,46 @@ Observed means seen in this repository's live captures. Listed means present in 
 | `TC` | Commit | Observed native |
 | `TR` | Rollback | Observed native |
 | `JS` | Read stream | Observed native |
-| `CU` | Close statement | Observed ODBC |
-| `GG` | Get auto-generated keys | Listed |
-| `DS` | Direct stored procedure | Listed |
+| `CU` | Close statement | Observed ODBC and native |
+| `GG` | Get auto-generated keys | Observed native, unreliable |
+| `DS` | Direct stored procedure | Observed ODBC and native |
 | `SP` | Prepare stored procedure | Listed |
 | `SU` | Stored-procedure update execute | Listed |
 | `SQ` | Stored-procedure query execute | Listed |
 | `SF` | Stored-procedure fetch data | Listed |
-| `MR` | Get more results | Listed |
-| `MD` | Multiple-result-set fetch data | Listed |
-| `RC` | Read committed | Listed |
-| `RU` | Read uncommitted | Listed |
-| `IL` | Isolation level | Listed |
-| `AF` | Autocommit off | Listed |
-| `AN` | Autocommit on | Listed |
-| `TS` | Toggle synchronous commit | Listed |
-| `SS` | Get stream size | Listed |
+| `MR` | Get more results | Observed ODBC and native |
+| `MD` | Multiple-result-set fetch data | Observed ODBC and native |
+| `RC` | Read committed | Observed ODBC and native |
+| `RU` | Read uncommitted | Observed ODBC and native |
+| `IL` | Isolation level | Observed native; no response on protocol 69 |
+| `AF` | Autocommit off | Observed ODBC and native |
+| `AN` | Autocommit on | Observed native |
+| `TS` | Toggle synchronous commit | Observed native, including status 409 |
+| `SS` | Get stream size | Observed native |
 | `RS` | Retrieve stream | Listed |
 | `OS` | Open stream | Listed |
 | `AS` | Read stream in ODBC form | Listed |
 | `SB` | Store binary stream | Listed |
 | `SM` | Store character stream | Listed |
 | `GB` | Stream get bytes | Listed |
-| `SZ` | Stream set bytes | Listed |
-| `SX` | Stream truncate | Listed |
-| `GP` | Stream get position | Listed |
-| `CS` | Close stream | Listed |
-| `41 c2` | Global get | Listed |
-| `42 c2` | Global set | Listed |
-| `43 c2` | Global kill | Listed |
-| `45 c2` | Global order | Listed |
-| `49 c2` | Global data | Listed |
-| `4b c2` | Class method returning value | Listed |
+| `SZ` | Stream set bytes | Observed native |
+| `SX` | Stream truncate | Observed native |
+| `GP` | Stream get position | Observed native; no response on protocol 69 |
+| `CS` | Close stream | Observed native |
+| `41 c2` | Global get | Observed native |
+| `42 c2` | Global set | Observed native |
+| `43 c2` | Global kill | Observed native |
+| `45 c2` | Global order | Observed native |
+| `49 c2` | Global data | Observed native |
+| `4b c2` | Class method returning value | Observed native |
 | `4c c2` | Void class method | Listed |
-| `5b c2` | Method returning value | Listed |
+| `5b c2` | Method returning value | Observed native |
 | `5c c2` | Void method | Listed |
-| `5d c2` | Property get | Listed |
-| `5e c2` | Property set | Listed |
+| `5d c2` | Property get | Observed native |
+| `5e c2` | Property set | Observed native |
 
 Feature flags seen in the independent implementation include fast select 1, fast insert 2, durable transactions 4, not-nullable 8, and redirect output 32. Their exact server negotiation and payload changes require per-feature captures.
 
 ## Open protocol questions
 
-The main unknowns are TLS negotiation, Kerberos and access-token login, protocol-version downgrade behavior, exact autocommit and isolation transitions, statement-close requirements, multi-result boundaries, output parameters, fast-insert descriptors and defaults, incremental stream writes, cancellation, server redirects, and all non-SQL object/global calls. These are blocking research items for full support, not details to paper over with aliases to SQL strings.
+The remaining unknowns are successful IRIS-over-TLS configurations, Kerberos and access-token login, protocol-version downgrade behavior, prepared procedures and output parameters, reliable generated keys, fast-insert partial-failure details, additional stream lifecycle operations, cancellation, server redirects, and non-SQL APIs such as XEP, documents, and vectors. These are blocking research items for full support, not details to paper over with aliases to SQL strings.

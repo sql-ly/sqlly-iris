@@ -1,5 +1,13 @@
 use crate::{Error, Result};
 
+pub(crate) fn placeholder_count(sql: &str) -> Result<usize> {
+    match rewrite_placeholders(sql, 0) {
+        Ok(_) => Ok(0),
+        Err(Error::ParameterCount { expected, .. }) => Ok(expected),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn rewrite_placeholders(sql: &str, parameter_count: usize) -> Result<String> {
     let bytes = sql.as_bytes();
     let mut output = Vec::with_capacity(sql.len() + parameter_count * 12);

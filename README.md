@@ -4,9 +4,34 @@ An independent, asynchronous Rust driver for InterSystems IRIS, paired with tool
 
 ## Status
 
-The repository contains a working core driver, not a completed Tiberius-equivalent release. Protocol 69 connections, direct queries, prepare/execute updates, positional parameters, streamed result fetching, transactions, server errors, and the SQL types listed in [the compatibility matrix](docs/compatibility.md) pass live tests against IRIS 2026.1. TLS, reusable prepared statements, multiple result sets, dedicated stored-procedure calls, bulk operations, incremental stream writes, catalog helpers, and non-SQL IRIS APIs are still on [the roadmap](docs/roadmap.md).
+The repository contains a broad native protocol 69 driver, not a completed Tiberius-equivalent release. Connections, direct and prepared SQL, streamed rows, stored procedures and multiple results, transactions and isolation, parameter arrays, native streams, globals, objects, catalog helpers, and the SQL types in [the compatibility matrix](docs/compatibility.md) pass live tests against IRIS 2026.1. All network operations are asynchronous and use safe Rust.
 
-The driver refuses `Encryption::Required` rather than silently downgrading to plaintext. Password authentication currently uses IRIS's reversible credential obfuscation, so use it only on a trusted local test network until TLS lands.
+TLS is implemented with `tokio-rustls` and certificate verification using native trust roots, with optional additional CA certificates. `Encryption::Disabled` is the only plaintext mode; `Encryption::Required` never downgrades or accepts an invalid certificate. Kerberos and OAuth access tokens, prepared stored procedures and output parameters, reliable generated-key retrieval, older protocol versions, runtime-independent adapters, and XEP/document/vector APIs remain on [the roadmap](docs/roadmap.md).
+
+## Driver capabilities
+
+- Direct queries and reusable prepared statements with explicit or deferred `CU` cleanup, `PQ`/`PU` execution, and `futures_core::Stream` adapters.
+- Stored procedures with input parameters, scalar returns, multiple result sets, `MD` continuation, and async cleanup.
+- Autocommit, read committed, read uncommitted, synchronous-commit toggling, and native commit/rollback.
+- Opt-in fast parameter arrays with exact identity/default metadata handling and per-row result processing.
+- Eager or handle-owning queries with stream size, prefix and full reads, truncation, one-based writes, and close.
+- Globals, class methods, instance methods, and properties using native OREF values.
+- Async schema, table, column, and procedure catalog queries.
+- Optional `chrono`, `time`, `rust_decimal`, `bigdecimal`, `uuid`, and `serde` conversions, with exact decimal and timestamp values preserved.
+
+## TLS
+
+```rust
+use sqlly_iris::{Client, Config, Encryption};
+
+let mut config = Config::from_url("iris://_SYSTEM:password@iris.example.com:1972/USER")?;
+config
+    .encryption(Encryption::Required)
+    .ca_certificate("/path/to/private-ca.pem");
+let client = Client::connect(config).await?;
+```
+
+The native root store is used by default. An additional CA file supplements those roots; it does not replace them or disable hostname verification. A TLS-enabled server is required, and a plaintext endpoint produces a TLS error instead of a connection fallback.
 
 ## Quick start
 
@@ -48,7 +73,9 @@ async fn main() -> Result<()> {
 
 `?` placeholders are rewritten only outside strings, quoted identifiers, and comments. `QueryStream::next_row` exposes incremental consumption; call `close` to drain a stream you do not finish. Dropping an unfinished stream or transaction deliberately makes the connection unusable, preventing later commands from reading stale protocol frames or running inside an ambiguous transaction.
 
-Parameters above 65,534 encoded bytes return an explicit error until stream-parameter writes are implemented. `max_rows` is IRIS's total result limit, not the network fetch size; IRIS chooses fetch buffers and the driver follows them with `FD` requests.
+Parameters above 65,534 encoded bytes return an explicit error until stream-parameter writes are implemented. `max_rows` is IRIS's total result limit, not the network fetch size; IRIS chooses fetch buffers and the driver follows them with `FD` requests. Fast parameter arrays require `config.fast_insert(true)` or `fast_insert=1` in the connection URL, keeping ordinary statements on the standard execution path.
+
+Optional Rust integrations are enabled independently: `chrono`, `time`, `rust_decimal`, `bigdecimal`, `uuid`, and `serde`. Add the features your application uses rather than taking every date/time and decimal dependency.
 
 ## Research tools
 

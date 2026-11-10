@@ -1,4 +1,5 @@
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
     Bool(bool),
@@ -14,6 +15,8 @@ pub enum Value {
     Time(String),
     Timestamp(String),
     PosixTimestamp { seconds: i64, micros: u32 },
+    ObjectRef(String),
+    StreamHandle { reference: String, binary: bool },
 }
 
 impl From<bool> for Value {

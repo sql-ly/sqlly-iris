@@ -24,6 +24,9 @@ pub enum Error {
     #[error("unknown column {0:?}")]
     ColumnName(String),
 
+    #[error("TLS error: {0}")]
+    Tls(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -79,6 +79,22 @@ impl<'a> ListItem<'a> {
         self.by_reference
     }
 
+    pub(crate) fn to_value(self) -> Result<Value> {
+        if self.is_null() {
+            return Ok(Value::Null);
+        }
+        match self.tag {
+            POSITIVE_INTEGER | NEGATIVE_INTEGER => Ok(Value::I64(self.as_i64()?)),
+            POSITIVE_DECIMAL | NEGATIVE_DECIMAL => Ok(Value::Decimal(self.as_decimal_string()?)),
+            COMPACT_FLOAT | IEEE_DOUBLE => Ok(Value::F64(self.as_f64()?)),
+            STRING | UNICODE => Ok(Value::String(self.as_string()?)),
+            OREF => Ok(Value::ObjectRef(self.as_string()?)),
+            other => Err(Error::Protocol(format!(
+                "unsupported untyped list item tag {other:#x}"
+            ))),
+        }
+    }
+
     pub(crate) fn as_i64(self) -> Result<i64> {
         if self.is_null() || self.is_empty() {
             return Ok(0);
@@ -212,6 +228,8 @@ pub(crate) fn validate_parameter(value: &Value) -> Result<()> {
             encoded_text_len(value, true)
         }
         Value::Bytes(value) => value.len(),
+        Value::ObjectRef(value) => encoded_text_len(value, false),
+        Value::StreamHandle { reference, .. } => reference.len(),
         _ => 0,
     };
     if encoded_length > MAX_LIST_DATA_LEN {
@@ -242,6 +260,8 @@ pub(crate) fn encode_item(output: &mut Vec<u8>, value: &Value) {
         Value::Decimal(value) => encode_text(output, value, true),
         Value::String(value) => encode_text(output, value, true),
         Value::Bytes(value) => encode_raw_string(output, value),
+        Value::ObjectRef(value) => encode_bytes(output, OREF, value.as_bytes(), false),
+        Value::StreamHandle { reference, .. } => encode_raw_string(output, reference.as_bytes()),
         Value::Date(value) | Value::Time(value) | Value::Timestamp(value) => {
             encode_text(output, value, true);
         }

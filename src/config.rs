@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use percent_encoding::percent_decode_str;
 use zeroize::Zeroizing;
@@ -23,7 +23,9 @@ pub struct Config {
     pub(crate) query_timeout: Duration,
     pub(crate) connect_timeout: Duration,
     pub(crate) max_rows: u32,
+    pub(crate) fast_insert: bool,
     pub(crate) encryption: Encryption,
+    pub(crate) ca_certificate: Option<PathBuf>,
 }
 
 impl Config {
@@ -44,7 +46,9 @@ impl Config {
             query_timeout: Duration::ZERO,
             connect_timeout: Duration::from_secs(10),
             max_rows: 0,
+            fast_insert: false,
             encryption: Encryption::Disabled,
+            ca_certificate: None,
         }
     }
 
@@ -90,6 +94,17 @@ impl Config {
                     config.max_rows = value.parse().map_err(|_| {
                         Error::InvalidConfig("max_rows must be an unsigned integer".into())
                     })?;
+                }
+                "fast_insert" => {
+                    config.fast_insert = match value.as_ref() {
+                        "1" | "true" => true,
+                        "0" | "false" => false,
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "fast_insert must be 0, 1, false, or true".into(),
+                            ));
+                        }
+                    };
                 }
                 "application_name" => config.application_name = value.into_owned(),
                 "encryption" => {
@@ -141,6 +156,16 @@ impl Config {
 
     pub fn max_rows(&mut self, rows: u32) -> &mut Self {
         self.max_rows = rows;
+        self
+    }
+
+    pub fn fast_insert(&mut self, enabled: bool) -> &mut Self {
+        self.fast_insert = enabled;
+        self
+    }
+
+    pub fn ca_certificate(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.ca_certificate = Some(path.into());
         self
     }
 
@@ -202,7 +227,9 @@ impl fmt::Debug for Config {
             .field("query_timeout", &self.query_timeout)
             .field("connect_timeout", &self.connect_timeout)
             .field("max_rows", &self.max_rows)
+            .field("fast_insert", &self.fast_insert)
             .field("encryption", &self.encryption)
+            .field("ca_certificate", &self.ca_certificate)
             .finish()
     }
 }

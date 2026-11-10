@@ -2,8 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::{net::TcpStream, time::timeout};
 
+use crate::transport;
+
 use crate::{
-    Column, Config, Encryption, Error, Nullable, PROTOCOL_VERSION, Result, Row, SqlType, Value,
+    Column, Config, Error, Nullable, PROTOCOL_VERSION, Result, Row, SqlType, Value,
     protocol::{
         Frame, ListItem, Operation, encode_item, encode_raw_string, encode_string, read_frame,
         rewrite_placeholders, write_frame,
@@ -11,6 +13,7 @@ use crate::{
 };
 
 const OPTION_FAST_SELECT: i64 = 1;
+const OPTION_FAST_INSERT: i64 = 2;
 const OPTION_DURABLE_TRANSACTIONS: i64 = 4;
 const OPTION_REDIRECT_OUTPUT: i64 = 32;
 const SQL_TEXT_CHUNK_SIZE: usize = 31_904;
@@ -33,25 +36,30 @@ pub struct ExecuteResult {
     pub rows_affected: u64,
 }
 
+pub(crate) struct PreparedParts {
+    pub(crate) statement_id: u32,
+    pub(crate) parameter_count: usize,
+    pub(crate) metadata: Vec<u8>,
+}
+
 pub struct Client {
-    stream: TcpStream,
+    stream: transport::BoxedStream,
     message_count: u32,
     statement_count: u32,
     query_timeout: Duration,
     max_rows: u32,
-    server_info: ServerInfo,
+    pub(crate) server_info: ServerInfo,
+    pub(crate) autocommit: bool,
+    pub(crate) isolation: crate::IsolationLevel,
     stream_active: bool,
+    pending_close: Vec<u32>,
+    pending_acks: Vec<u32>,
     unusable: Option<&'static str>,
 }
 
 impl Client {
     pub async fn connect(config: Config) -> Result<Self> {
         config.validate()?;
-        if config.encryption != Encryption::Disabled {
-            return Err(Error::Unsupported(
-                "TLS transport is not implemented; refusing to downgrade to plaintext",
-            ));
-        }
         let address = (config.host.as_str(), config.port);
         let stream = if config.connect_timeout.is_zero() {
             TcpStream::connect(address).await?
@@ -66,6 +74,7 @@ impl Client {
                 })??
         };
         stream.set_nodelay(true)?;
+        let stream = transport::establish(&config, stream).await?;
         let mut client = Self {
             stream,
             message_count: 0,
@@ -83,7 +92,11 @@ impl Client {
                 sql_empty_string: 0,
                 feature_options: 0,
             },
+            autocommit: true,
+            isolation: crate::IsolationLevel::ReadUncommitted,
             stream_active: false,
+            pending_close: Vec::new(),
+            pending_acks: Vec::new(),
             unusable: None,
         };
         client.handshake().await?;
@@ -96,7 +109,24 @@ impl Client {
     }
 
     pub async fn query(&mut self, sql: &str, parameters: &[Value]) -> Result<QueryStream<'_>> {
-        self.ensure_usable()?;
+        self.query_internal(sql, parameters, true).await
+    }
+
+    pub async fn query_with_handles(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+    ) -> Result<QueryStream<'_>> {
+        self.query_internal(sql, parameters, false).await
+    }
+
+    async fn query_internal(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+        resolve_streams: bool,
+    ) -> Result<QueryStream<'_>> {
+        self.ready().await?;
         for parameter in parameters {
             crate::protocol::validate_parameter(parameter)?;
         }
@@ -115,13 +145,152 @@ impl Client {
             .await?;
         self.check_status(&metadata).await?;
         let response_count = metadata.count;
-        let mut input = metadata.payload.as_slice();
+        let data = self.read_response(response_count).await?;
+        self.check_status(&data).await?;
+        self.query_stream_from_parts(statement_id, &metadata.payload, data, resolve_streams)
+    }
+
+    pub async fn execute(&mut self, sql: &str, parameters: &[Value]) -> Result<ExecuteResult> {
+        let parts = self.prepare_statement_parts(sql).await?;
+        let result = self.execute_prepared_parts(&parts, parameters).await;
+        let close = self.close_statement_now(parts.statement_id).await;
+        close?;
+        result
+    }
+
+    pub(crate) async fn prepare_statement_parts(&mut self, sql: &str) -> Result<PreparedParts> {
+        self.ready().await?;
+        let parameter_count = crate::protocol::placeholder_count(sql)?;
+        let sql = rewrite_placeholders(sql, parameter_count)?;
+        let statement_id = self.next_statement_id();
+        let mut payload = Vec::new();
+        encode_sql_text(&mut payload, &sql);
+        encode_i64(&mut payload, parameter_count as i64);
+        for _ in 0..parameter_count {
+            encode_i64(&mut payload, 99);
+            encode_i64(&mut payload, 1);
+        }
+        let response = self
+            .exchange(Operation::Prepare, statement_id, &payload)
+            .await?;
+        self.check_status(&response).await?;
+        Ok(PreparedParts {
+            statement_id,
+            parameter_count,
+            metadata: response.payload,
+        })
+    }
+
+    pub(crate) async fn execute_prepared_parts(
+        &mut self,
+        parts: &PreparedParts,
+        parameters: &[Value],
+    ) -> Result<ExecuteResult> {
+        self.execute_many_prepared_parts(parts, &[parameters.to_vec()])
+            .await
+    }
+
+    pub(crate) async fn execute_many_prepared_parts(
+        &mut self,
+        parts: &PreparedParts,
+        batches: &[Vec<Value>],
+    ) -> Result<ExecuteResult> {
+        self.ready().await?;
+        if batches.is_empty() {
+            return Ok(ExecuteResult { rows_affected: 0 });
+        }
+        for batch in batches {
+            validate_parameters(parts.parameter_count, batch)?;
+        }
+        let metadata = parse_update_metadata(&parts.metadata)?;
+        if batches.len() > 1 && !metadata.fast_insert {
+            return Err(Error::Unsupported(
+                "parameter arrays require fast-insert support for this statement",
+            ));
+        }
+        let mut execution = Vec::new();
+        if metadata.fast_insert && batches.len() > 1 {
+            execution.extend_from_slice(&(batches.len() as u32).to_le_bytes());
+        }
+        encode_string(&mut execution, "");
+        encode_i64(&mut execution, 0);
+        if metadata.fast_insert && batches.len() > 1 {
+            if metadata.identity_column {
+                encode_i64(&mut execution, 2);
+            } else {
+                encode_i64(&mut execution, 1);
+            }
+        } else {
+            encode_i64(&mut execution, 1);
+            encode_i64(&mut execution, batches[0].len() as i64);
+        }
+        if metadata.fast_insert && batches.len() > 1 {
+            for batch in batches {
+                let mut packed = Vec::new();
+                for parameter in batch {
+                    encode_item(&mut packed, parameter);
+                }
+                for default in &metadata.defaults {
+                    encode_item(&mut packed, default);
+                }
+                encode_string(&mut execution, "");
+                encode_raw_string(&mut execution, &packed);
+            }
+        } else {
+            for parameter in &batches[0] {
+                encode_item(&mut execution, parameter);
+            }
+        }
+        let response = self
+            .exchange(Operation::PreparedUpdate, parts.statement_id, &execution)
+            .await?;
+        self.check_status(&response).await?;
+        let rows_affected = if metadata.fast_insert && batches.len() > 1 {
+            batches.len() as u64
+        } else {
+            let mut input = response.payload.as_slice();
+            u64::try_from(read_i64(&mut input)?).unwrap_or(0)
+        };
+        Ok(ExecuteResult { rows_affected })
+    }
+
+    pub(crate) async fn query_prepared_parts(
+        &mut self,
+        parts: &PreparedParts,
+        parameters: &[Value],
+    ) -> Result<QueryStream<'_>> {
+        self.ready().await?;
+        validate_parameters(parts.parameter_count, parameters)?;
+        let mut execution = Vec::new();
+        encode_i64(&mut execution, 1);
+        encode_i64(&mut execution, parameters.len() as i64);
+        for parameter in parameters {
+            encode_item(&mut execution, parameter);
+        }
+        encode_i64(
+            &mut execution,
+            self.query_timeout.as_secs().try_into().unwrap_or(i64::MAX),
+        );
+        encode_i64(&mut execution, i64::from(self.max_rows));
+        let data = self
+            .exchange(Operation::PreparedQuery, parts.statement_id, &execution)
+            .await?;
+        self.check_status(&data).await?;
+        self.query_stream_from_parts(parts.statement_id, &parts.metadata, data, true)
+    }
+
+    fn query_stream_from_parts(
+        &mut self,
+        statement_id: u32,
+        metadata: &[u8],
+        data: Frame,
+        resolve_streams: bool,
+    ) -> Result<QueryStream<'_>> {
+        let mut input = metadata;
         let feature = StatementFeature::parse(&mut input)?;
         let columns = Arc::new(parse_columns(&mut input, &feature)?);
         let _parameter_count = read_i64(&mut input)?;
         let _parameter_flag = read_i64(&mut input)?;
-        let data = self.read_response(response_count).await?;
-        self.check_status(&data).await?;
         self.stream_active = true;
         Ok(QueryStream {
             client: self,
@@ -131,63 +300,88 @@ impl Client {
             buffer: data.payload,
             offset: 0,
             status: data.status as i16,
+            resolve_streams,
             finished: false,
         })
     }
 
-    pub async fn execute(&mut self, sql: &str, parameters: &[Value]) -> Result<ExecuteResult> {
-        self.ensure_usable()?;
-        for parameter in parameters {
-            crate::protocol::validate_parameter(parameter)?;
+    pub(crate) async fn decode_procedure_result(
+        &mut self,
+        statement_id: u32,
+        frame: Frame,
+        include_return: bool,
+    ) -> Result<Option<crate::procedure::ProcedureResult>> {
+        let mut probe = frame.payload.as_slice();
+        let first = ListItem::parse(&mut probe)?.to_value()?;
+        if first == Value::I64(-2) {
+            return Ok(None);
         }
-        let sql = rewrite_placeholders(sql, parameters.len())?;
-        let statement_id = self.next_statement_id();
-        let mut payload = Vec::new();
-        encode_sql_text(&mut payload, &sql);
-        encode_i64(&mut payload, parameters.len() as i64);
-        for _ in parameters {
-            encode_i64(&mut payload, 99);
-            encode_i64(&mut payload, 1);
-        }
-        let response = self
-            .exchange(Operation::Prepare, statement_id, &payload)
-            .await?;
-        self.check_status(&response).await?;
-        let mut input = response.payload.as_slice();
+        let (return_value, mut input) = if include_return && first != Value::I64(-1) {
+            (Some(first), probe)
+        } else {
+            (None, frame.payload.as_slice())
+        };
         let feature = StatementFeature::parse(&mut input)?;
-        if feature.option & 2 != 0 {
-            return Err(Error::Unsupported(
-                "fast-insert response decoding is not implemented",
-            ));
-        }
-        let parameter_count = read_i64(&mut input)?;
-        if parameter_count < 0 {
-            return Err(Error::Protocol("negative update parameter count".into()));
-        }
-        for _ in 0..parameter_count {
-            for _ in 0..4 {
-                let _ = ListItem::parse(&mut input)?;
+        let columns = Arc::new(parse_columns(&mut input, &feature)?);
+        let mut rows = Vec::new();
+        let mut buffer = input.to_vec();
+        let mut status = frame.status as i16;
+        loop {
+            let mut offset = 0;
+            while offset < buffer.len() {
+                let decoded = decode_row(&buffer, &mut offset, &columns, &feature)?;
+                let mut values = Vec::with_capacity(decoded.len());
+                for cell in decoded {
+                    values.push(match cell {
+                        DecodedCell::Value(value) => value,
+                        DecodedCell::Stream { handle, binary } => {
+                            self.fetch_stream(handle, -1, binary).await?
+                        }
+                    });
+                }
+                rows.push(Row {
+                    columns: Arc::clone(&columns),
+                    values,
+                });
+            }
+            if status == 100 {
+                break;
+            }
+            let response = self
+                .operation(Operation::MultipleResultSetsFetchData, statement_id, &[])
+                .await?;
+            status = response.status as i16;
+            buffer = response.payload;
+            if buffer.is_empty() && status != 100 {
+                return Err(Error::Protocol(
+                    "procedure continuation returned an empty successful frame".into(),
+                ));
             }
         }
-        let _flags = read_i64(&mut input)?;
+        Ok(Some(crate::procedure::ProcedureResult {
+            return_value,
+            columns,
+            rows,
+        }))
+    }
 
-        let mut execution = Vec::new();
-        encode_string(&mut execution, "");
-        encode_i64(&mut execution, 0);
-        encode_i64(&mut execution, 1);
-        encode_i64(&mut execution, parameters.len() as i64);
-        for parameter in parameters {
-            encode_item(&mut execution, parameter);
+    pub(crate) fn defer_statement_close(&mut self, statement_id: u32) {
+        if !self.pending_close.contains(&statement_id) {
+            self.pending_close.push(statement_id);
         }
-        let response = self
-            .exchange(Operation::PreparedUpdate, statement_id, &execution)
-            .await?;
-        self.check_status(&response).await?;
-        let mut input = response.payload.as_slice();
-        let rows_affected = read_i64(&mut input)?;
-        Ok(ExecuteResult {
-            rows_affected: u64::try_from(rows_affected).unwrap_or(0),
-        })
+    }
+
+    pub(crate) async fn close_statement_now(&mut self, statement_id: u32) -> Result<()> {
+        self.pending_close.retain(|id| *id != statement_id);
+        let count = self.next_count();
+        write_frame(
+            &mut self.stream,
+            Operation::CloseStatement,
+            count,
+            statement_id,
+            &[],
+        )
+        .await
     }
 
     pub async fn begin(&mut self) -> Result<Transaction<'_>> {
@@ -199,6 +393,10 @@ impl Client {
     }
 
     pub async fn close(mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_close);
+        for statement_id in pending {
+            self.close_statement_now(statement_id).await?;
+        }
         let count = self.next_count();
         write_frame(&mut self.stream, Operation::Disconnect, count, 0, &[]).await?;
         tokio::io::AsyncWriteExt::shutdown(&mut self.stream).await?;
@@ -232,10 +430,14 @@ impl Client {
         encode_string(&mut payload, "");
         encode_i64(&mut payload, 1);
         encode_i64(&mut payload, 0);
-        encode_i64(
-            &mut payload,
-            OPTION_FAST_SELECT | OPTION_DURABLE_TRANSACTIONS | OPTION_REDIRECT_OUTPUT,
-        );
+        let feature_options =
+            OPTION_FAST_SELECT | OPTION_DURABLE_TRANSACTIONS | OPTION_REDIRECT_OUTPUT;
+        let feature_options = if config.fast_insert {
+            feature_options | OPTION_FAST_INSERT
+        } else {
+            feature_options
+        };
+        encode_i64(&mut payload, feature_options);
         let response = self.exchange(Operation::Connect, 0, &payload).await?;
         if response.status == 417 {
             let mut input = response.payload.as_slice();
@@ -256,7 +458,7 @@ impl Client {
 
     async fn check_status(&mut self, frame: &Frame) -> Result<()> {
         let code = frame.status as i16;
-        if code == 0 || code == 100 {
+        if code == 0 || code == 100 || frame.status == 0xca00 {
             return Ok(());
         }
         let message = self.get_server_error(code).await?;
@@ -273,11 +475,16 @@ impl Client {
         read_string(&mut input)
     }
 
-    async fn fetch_stream(&mut self, handle: String, binary: bool) -> Result<Value> {
+    pub(crate) async fn fetch_stream(
+        &mut self,
+        handle: String,
+        length: i32,
+        binary: bool,
+    ) -> Result<Value> {
         let statement_id = self.next_statement_id();
         let mut payload = Vec::new();
         encode_string(&mut payload, &handle);
-        encode_i64(&mut payload, -1);
+        encode_i64(&mut payload, i64::from(length));
         let response = self
             .exchange(Operation::ReadStream, statement_id, &payload)
             .await?;
@@ -291,6 +498,31 @@ impl Client {
         }
     }
 
+    pub(crate) async fn native_operation(
+        &mut self,
+        operation: Operation,
+        payload: &[u8],
+    ) -> Result<Frame> {
+        self.ready().await?;
+        let response = self.exchange(operation, 0, payload).await?;
+        if !matches!(response.status, 0xca00 | 0xce01 | 0xcdf1 | 0xce7b) {
+            self.check_status(&response).await?;
+        }
+        Ok(response)
+    }
+
+    pub(crate) async fn session_send_payload(
+        &mut self,
+        operation: Operation,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.ready().await?;
+        let count = self.next_count();
+        write_frame(&mut self.stream, operation, count, 0, payload).await?;
+        self.pending_acks.push(count);
+        Ok(())
+    }
+
     async fn exchange(
         &mut self,
         operation: Operation,
@@ -299,25 +531,43 @@ impl Client {
     ) -> Result<Frame> {
         let count = self.next_count();
         write_frame(&mut self.stream, operation, count, statement_id, payload).await?;
-        self.read_response(count).await
+        Box::pin(self.read_response(count)).await
     }
 
     async fn read_response(&mut self, expected_count: u32) -> Result<Frame> {
-        let frame = read_frame(&mut self.stream).await?;
-        tracing::trace!(
-            count = frame.count,
-            statement_id = frame.statement_id,
-            status = frame.status,
-            payload_len = frame.payload.len(),
-            "received IRIS frame"
-        );
-        if frame.count != expected_count {
-            return Err(Error::Protocol(format!(
-                "response count {} does not match request count {expected_count}",
-                frame.count
-            )));
+        loop {
+            let frame = read_frame(&mut self.stream).await?;
+            tracing::trace!(
+                count = frame.count,
+                statement_id = frame.statement_id,
+                status = frame.status,
+                payload_len = frame.payload.len(),
+                "received IRIS frame"
+            );
+            if let Some(index) = self
+                .pending_acks
+                .iter()
+                .position(|count| *count == frame.count)
+            {
+                self.pending_acks.remove(index);
+                let code = frame.status as i16;
+                if code != 0 && code != 100 && frame.status != 0xca00 {
+                    self.unusable = Some("a stream operation failed; close the connection");
+                    return Err(Error::Server {
+                        code,
+                        message: "stream operation failed".into(),
+                    });
+                }
+                continue;
+            }
+            if frame.count != expected_count {
+                return Err(Error::Protocol(format!(
+                    "response count {} does not match request count {expected_count}",
+                    frame.count
+                )));
+            }
+            return Ok(frame);
         }
-        Ok(frame)
     }
 
     fn next_statement_id(&mut self) -> u32 {
@@ -330,6 +580,44 @@ impl Client {
         let value = self.message_count;
         self.message_count = self.message_count.wrapping_add(1);
         value
+    }
+
+    pub(crate) fn allocate_statement_id(&mut self) -> u32 {
+        self.next_statement_id()
+    }
+
+    pub(crate) async fn operation(
+        &mut self,
+        operation: Operation,
+        statement_id: u32,
+        payload: &[u8],
+    ) -> Result<Frame> {
+        self.ready().await?;
+        let response = self.exchange(operation, statement_id, payload).await?;
+        self.check_status(&response).await?;
+        Ok(response)
+    }
+
+    pub(crate) async fn session_send(&mut self, operation: Operation) -> Result<()> {
+        self.ready().await?;
+        let count = self.next_count();
+        write_frame(&mut self.stream, operation, count, 0, &[]).await
+    }
+
+    pub(crate) async fn session_frame(&mut self, operation: Operation) -> Result<Frame> {
+        self.ready().await?;
+        let response = self.exchange(operation, 0, &[]).await?;
+        self.check_status(&response).await?;
+        Ok(response)
+    }
+
+    async fn ready(&mut self) -> Result<()> {
+        self.ensure_usable()?;
+        let pending = std::mem::take(&mut self.pending_close);
+        for statement_id in pending {
+            self.close_statement_now(statement_id).await?;
+        }
+        Ok(())
     }
 
     fn ensure_usable(&self) -> Result<()> {
@@ -368,6 +656,19 @@ fn encode_sql_text(output: &mut Vec<u8>, sql: &str) {
     }
 }
 
+fn validate_parameters(expected: usize, parameters: &[Value]) -> Result<()> {
+    if expected != parameters.len() {
+        return Err(Error::ParameterCount {
+            expected,
+            actual: parameters.len(),
+        });
+    }
+    for parameter in parameters {
+        crate::protocol::validate_parameter(parameter)?;
+    }
+    Ok(())
+}
+
 fn encode_query_parameters(output: &mut Vec<u8>, parameters: &[Value]) {
     encode_i64(output, parameters.len() as i64);
     for _ in parameters {
@@ -394,12 +695,65 @@ fn take_u16(input: &mut &[u8]) -> Result<u16> {
     Ok(value)
 }
 
-fn read_i64(input: &mut &[u8]) -> Result<i64> {
+pub(crate) fn read_i64(input: &mut &[u8]) -> Result<i64> {
     ListItem::parse(input)?.as_i64()
 }
 
 fn read_string(input: &mut &[u8]) -> Result<String> {
     ListItem::parse(input)?.as_string()
+}
+
+struct UpdateMetadata {
+    fast_insert: bool,
+    identity_column: bool,
+    defaults: Vec<Value>,
+}
+
+fn parse_update_metadata(metadata: &[u8]) -> Result<UpdateMetadata> {
+    let mut input = metadata;
+    let feature = StatementFeature::parse(&mut input)?;
+    let fast_insert = feature.option & 2 != 0;
+    let parameter_count = read_i64(&mut input)?;
+    if parameter_count < 0 {
+        return Err(Error::Protocol("negative update parameter count".into()));
+    }
+    for index in 0..parameter_count {
+        let _parameter_type = read_i64(&mut input)?;
+        let _precision = read_i64(&mut input)?;
+        let _scale = read_i64(&mut input)?;
+        let _ = ListItem::parse(&mut input)?;
+        if fast_insert {
+            let _nullable = read_i64(&mut input)?;
+            let _position = read_i64(&mut input)?;
+            let _ = read_string(&mut input)?;
+            let _ = read_string(&mut input)?;
+            if index == 0 {
+                let _table_name = read_string(&mut input)?;
+            }
+            let _column_name = read_string(&mut input)?;
+        }
+    }
+    let _flags = read_i64(&mut input)?;
+    let mut identity_column = false;
+    let mut defaults = Vec::new();
+    if fast_insert {
+        let packed = ListItem::parse(&mut input)?;
+        let mut packed_input = packed.data();
+        if !packed_input.is_empty() {
+            identity_column = ListItem::parse(&mut packed_input)?.is_empty();
+            while !packed_input.is_empty() {
+                let item = ListItem::parse(&mut packed_input)?;
+                if !item.is_null() {
+                    defaults.push(item.to_value()?);
+                }
+            }
+        }
+    }
+    Ok(UpdateMetadata {
+        fast_insert,
+        identity_column,
+        defaults,
+    })
 }
 
 #[derive(Debug)]
@@ -461,7 +815,7 @@ fn parse_columns(input: &mut &[u8], feature: &StatementFeature) -> Result<Vec<Co
                 flags.len()
             )));
         }
-        let slot_position = if feature.option & OPTION_FAST_SELECT != 0 {
+        let slot_position = if feature.option == OPTION_FAST_SELECT {
             let position = read_i64(input)?;
             usize::try_from(position - 1)
                 .map_err(|_| Error::Protocol("invalid fast-select slot position".into()))?
@@ -501,7 +855,7 @@ fn decode_row(
     feature: &StatementFeature,
 ) -> Result<Vec<DecodedCell>> {
     let mut input = &buffer[*offset..];
-    let items = if feature.option & OPTION_FAST_SELECT != 0 {
+    let items = if feature.option == OPTION_FAST_SELECT {
         let packed = ListItem::parse(&mut input)?;
         let mut packed_input = packed.data();
         let mut items = Vec::with_capacity(feature.max_row_item_count);
@@ -604,12 +958,22 @@ pub struct QueryStream<'a> {
     buffer: Vec<u8>,
     offset: usize,
     status: i16,
+    resolve_streams: bool,
     finished: bool,
 }
 
-impl QueryStream<'_> {
+impl<'a> QueryStream<'a> {
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    pub fn into_stream(self) -> impl futures_core::Stream<Item = Result<Row>> + Send + 'a {
+        async_stream::try_stream! {
+            let mut stream = self;
+            while let Some(row) = stream.next_row().await? {
+                yield row;
+            }
+        }
     }
 
     pub async fn next_row(&mut self) -> Result<Option<Row>> {
@@ -646,7 +1010,14 @@ impl QueryStream<'_> {
             values.push(match cell {
                 DecodedCell::Value(value) => value,
                 DecodedCell::Stream { handle, binary } => {
-                    self.client.fetch_stream(handle, binary).await?
+                    if self.resolve_streams {
+                        self.client.fetch_stream(handle, -1, binary).await?
+                    } else {
+                        Value::StreamHandle {
+                            reference: handle,
+                            binary,
+                        }
+                    }
                 }
             });
         }
