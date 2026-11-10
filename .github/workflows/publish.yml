@@ -1,0 +1,49 @@
+name: Publish crate
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the crate to crates.io
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates.io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check release tag against Cargo.toml
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"]=="sqlly-iris"))')"
+          if [[ "$expected" != "$actual" ]]; then
+            echo "Release tag version $expected does not match Cargo.toml version $actual" >&2
+            exit 1
+          fi
+      - run: cargo publish --dry-run --locked
+      - name: Publish to crates.io
+        if: github.event_name == 'release' || inputs.publish
+        run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -103,6 +103,10 @@ IRIS_DSN='iris://_SYSTEM:password@127.0.0.1:1972/USER' cargo test --test live --
 
 The live test creates and drops its own table and must only target a disposable instance. Ordinary tests do not need IRIS.
 
+## Publishing to crates.io
+
+Add `CARGO_REGISTRY_TOKEN` as a repository secret containing a crates.io API token with publish permission for `sqlly-iris`. The `Publish crate` workflow runs the same checks as CI, verifies the package with `cargo publish --dry-run --locked`, and publishes only after those checks pass. Create a GitHub release whose tag matches the version in `Cargo.toml` (for example `v0.1.0`), or run the workflow manually with **Publish the crate to crates.io** selected. The optional `crates.io` environment can require approval before publication.
+
 ## License and attribution
 
 Apache-2.0. See [NOTICE](NOTICE) for the `go-irisnative` attribution and reviewed upstream commit. InterSystems and InterSystems IRIS are trademarks of InterSystems Corporation; this is an independent interoperability project.

@@ -44,7 +44,7 @@ The goal is a production-quality native Rust driver, not an ODBC wrapper. A feat
 - Match Tiberius-style query, execute, transaction, bulk, configuration, authentication, encryption, and error ergonomics where they fit IRIS.
 - Run unit and live matrices on macOS ARM64, Linux x86_64 and ARM64, and Windows x86_64 and ARM64, with supported IRIS versions and Unicode/non-Unicode locales.
 - Add cross-driver differential jobs for the vendor ODBC versions in the support matrix, plus stress, soak, cancellation, disconnect, failover, and memory-bounds tests.
-- Publish versioned crates only after documentation, compatibility tables, semantic-versioning policy, security reporting, and release automation are in place.
+- Finish semantic-versioning policy and security reporting, then publish versioned crates through `.github/workflows/publish.yml` after those gates pass.
 
 ## Current acceptance bar
 

@@ -11,3 +11,7 @@ Keep markdown paragraphs on one line and let viewers soft-wrap. Do not add AI by
 The initial protocol codec is an independent Rust rewrite informed by `caretdev/go-irisnative` under Apache-2.0. Preserve `NOTICE` and record the upstream commit when updating that attribution.
 
 macOS builds target Apple Silicon. Changes must also compile on Linux and Windows; avoid platform-specific dependencies unless they are optional and feature-gated.
+
+## Crate publishing
+
+Use `.github/workflows/publish.yml` for releases. The workflow requires a GitHub release tag matching `Cargo.toml` or an explicit manual confirmation, and it reads the crates.io API token only from the `CARGO_REGISTRY_TOKEN` repository secret. Never print, commit, or write that token to a file. Do not publish directly from a development machine.
