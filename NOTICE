@@ -1,0 +1,6 @@
+sqlly-iris
+Copyright 2026 sql-ly contributors
+
+This product includes an independent Rust implementation informed by go-irisnative (https://github.com/caretdev/go-irisnative), Copyright 2025 Dmitry Maslennikov, licensed under Apache License 2.0. The reviewed upstream commit was 97ff78dcce8a0a3fcb8cf7a677bc1d8b3504e3e2. The Rust implementation changes the runtime, API, bounds checking, parameter handling, result streaming, update execution, and error model.
+
+InterSystems and InterSystems IRIS are trademarks of InterSystems Corporation. This project is independent and is not endorsed by InterSystems Corporation.

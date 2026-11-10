@@ -1,0 +1,31 @@
+[package]
+name = "sqlly-iris"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Async InterSystems IRIS driver and ODBC differential research tools"
+license = "Apache-2.0"
+repository = "https://github.com/sql-ly/sqlly-iris"
+keywords = ["iris", "intersystems", "database", "sql", "async"]
+categories = ["database"]
+
+[lib]
+name = "sqlly_iris"
+
+[dependencies]
+percent-encoding = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
